@@ -1,26 +1,22 @@
-#include <helper_3dmath.h>
-#include <MPU6050_6Axis_MotionApps20.h>
-#include <MPU6050.h>
-
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
 
 #include <Wire.h>
 #include <WiFiUdp.h>
 #include <ESP8266WiFi.h>
 #include <EEPROM.h>
+#include <Adafruit_ADS1015.h>
 
 String WifiSSIDPrefix = "CrystalPoint";
 uint16_t BasestationPort = 2730;
 IPAddress BasestationIp = IPAddress(192, 168, 4, 1);
 
+Adafruit_ADS1115 ads;
+
 struct MPU6050Data{
-  int gx;
-  int gy;
-  int gz;
-  int ax;
-  int ay;
-  int az;
-  int fx;
-  int fy;  
+  int yaw;
+  int pitch;
+  int roll;  
 };
 
 struct JoystickData{
@@ -34,6 +30,29 @@ struct SwitchData{
   char magnetSwitch;
 };
 
+//mpu6050
+MPU6050 mpu;
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+    mpuInterrupt = true;
+}
+
 //Data buffer for sensors
 struct MPU6050Data mpu6050data = {0};
 struct JoystickData joystickdata = {0};
@@ -42,6 +61,7 @@ struct SwitchData switchdata = {0};
 //UDP server (receiving) setup
 unsigned int udpPort = 2730;
 byte packetBuffer[512]; //udp package buffer
+char sendBuffer[45];
 WiFiUDP Udp;
 
 void setup(void){
@@ -50,58 +70,136 @@ void setup(void){
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();  
   EEPROM.begin(512);
-  Udp.begin(udpPort);
 
+  delay(10);
+  Udp.begin(udpPort);
+  Wire.begin();
+
+  //Magnetic sensor
+  pinMode(13,INPUT);
+  
   //clearEeprom();
-  //connectLastBasestation();
-  searchBasestation();
+  connectLastBasestation();
+  //searchBasestation();
+
+  delay(1000);
+  ads.begin();
+  
+  mpu6050setup();
+}
+
+void mpu6050setup(){
+  mpu.initialize(); 
+  Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+  devStatus = mpu.dmpInitialize();
+  
+  mpu.setXGyroOffset(62);
+  mpu.setYGyroOffset(25);
+  mpu.setZGyroOffset(-11);
+  mpu.setXAccelOffset(-2030);
+  mpu.setYAccelOffset(11);
+  mpu.setZAccelOffset(2119); // 1688 factory default for my test chip
+
+  if (devStatus == 0) {
+    mpu.setDMPEnabled(true);
+
+    attachInterrupt(15, dmpDataReady, RISING); //intrupt pin on pin 15
+    mpuIntStatus = mpu.getIntStatus();
+
+    dmpReady = true;
+
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    } else {
+        Serial.print(F("DMP Initialization failed (code "));
+        Serial.print(devStatus);
+        Serial.println(F(")"));
+    }
 }
 
 void loop(void){
-  //receiving rumble or shock data from basestation
-  int noBytes = Udp.parsePacket();
-  if ( noBytes ) {
-    Serial.print(millis() / 1000);
-    Serial.print(":Packet of ");
-    Serial.print(noBytes);
-    Serial.print(" received from ");
-    Serial.print(Udp.remoteIP());
-    Serial.print(":");
-    Serial.println(Udp.remotePort());
-    // We've received a packet, read the data from it
-    Udp.read(packetBuffer,noBytes); // read the packet into the buffer
-
-    // display the packet contents in HEX
-    for (int i=1;i<=noBytes;i++){
-      Serial.print(packetBuffer[i-1],HEX);
-      if (i % 32 == 0){
+  //wait for interupt from mpu6050, in the mean time pol udp server for new data
+  while (!mpuInterrupt && fifoCount < packetSize) {
+    //receiving rumble or shock data from basestation
+    int noBytes = Udp.parsePacket();
+    if ( noBytes ) {
+        Serial.print(millis() / 1000);
+        Serial.print(":Packet of ");
+        Serial.print(noBytes);
+        Serial.print(" received from ");
+        Serial.print(Udp.remoteIP());
+        Serial.print(":");
+        Serial.println(Udp.remotePort());
+        // We've received a packet, read the data from it
+        Udp.read(packetBuffer,noBytes); // read the packet into the buffer
+        
+        // display the packet contents in HEX
+        for (int i=1;i<=noBytes;i++){
+          Serial.print(packetBuffer[i-1],HEX);
+          if (i % 32 == 0){
+            Serial.println();
+          }
+          else Serial.print(' ');
+        } 
         Serial.println();
-      }
-      else Serial.print(' ');
     } 
-    Serial.println();
-  } 
-
-  //Send new data  
-  joystickdata.x = 1;
-  joystickdata.y = 2;
-  joystickdata.button = 0;
-  mpu6050data.gx = 1;
-  mpu6050data.gy = 2;
-  mpu6050data.gz = 3;
-  mpu6050data.ax = 4;
-  mpu6050data.ay = 5;
-  mpu6050data.az = 6;
-  mpu6050data.fx = 7;
-  mpu6050data.fy = 8;
-  switchdata.backSwitch = 9;
-  switchdata.magnetSwitch = 10;
-
-
-  sendUdpMessage(&joystickdata, &mpu6050data, &switchdata);
+    delay(2);
+  }
   
-  //30 times per second new data
-  delay(33);
+  //We are out of the while loop, so mpu interupt fired;
+  readFifoMpu6050(&mpu6050data);  
+
+  readSwitches(&switchdata);
+
+  readJoystick(&joystickdata);
+  
+  //Send new data  
+  joystickdata.button = 0;
+
+  sendUdpMessage(&joystickdata, &mpu6050data, &switchdata); 
+}
+
+void readJoystick(struct JoystickData *joystickdata){
+  joystickdata->x = ads.readADC_SingleEnded(0);
+  joystickdata->y = ads.readADC_SingleEnded(1);
+}
+
+void readFifoMpu6050(struct MPU6050Data *mpu6050data){
+  // reset interrupt flag and get INT_STATUS byte
+    mpuInterrupt = false;
+    mpuIntStatus = mpu.getIntStatus();
+ 
+  // get current FIFO count
+  fifoCount = mpu.getFIFOCount();
+
+  // check for overflow (this should never happen unless our code is too inefficient)
+  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+        // reset so we can continue cleanly
+        mpu.resetFIFO();
+        Serial.println(F("FIFO overflow!"));
+  } else if (mpuIntStatus & 0x02){  
+    // wait for correct available data length, should be a VERY short wait
+    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+    // read a packet from FIFO
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+        
+    // track FIFO count here in case there is > 1 packet available
+    // (this lets us immediately read more without waiting for an interrupt)
+    fifoCount -= packetSize;
+    
+    // get Euler angles in degrees
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+    mpu6050data->yaw = ypr[0] * 18000/M_PI;
+    mpu6050data->pitch = ypr[1] * 18000/M_PI;
+    mpu6050data->roll = ypr[2] * 18000/M_PI;  
+  }
+}
+
+void readSwitches(struct SwitchData *switchdata){
+  switchdata->magnetSwitch = !digitalRead(13);  
 }
 
 void searchBasestation(void){
@@ -121,6 +219,10 @@ void searchBasestation(void){
   
         //Connect to the basestation
         WiFi.begin(WifiSSID, WifiPassword);
+        while (WiFi.status() != WL_CONNECTED) {
+          delay(500);
+          Serial.print(".");
+        }
   
         ///Writing data to eeprom
         writeEeprom(WifiSSID, WifiPassword);
@@ -158,6 +260,10 @@ void connectLastBasestation(void){
       
       //Connect to the basestation
       WiFi.begin(eepromWifiSSID, eepromWifiPassword);
+      while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+      }
     } 
 }
 
@@ -174,13 +280,12 @@ void calculateWiFiPassword(String WifiSSID, char *WifiPassword)
 }
 
 void sendUdpMessage(struct JoystickData *joystick, struct MPU6050Data *mpu6050data, struct SwitchData *switchdata){
-  char sendBuffer[512];
   Udp.beginPacket(BasestationIp, BasestationPort);
-  sprintf(sendBuffer, "%06d%06d%01d", joystick->x, joystick->y, joystick->button);
-  sprintf(sendBuffer, "%s%06d%06d%06d%06d%06d%06d%06d%06d", sendBuffer, mpu6050data->gx, mpu6050data->gy, mpu6050data->gz, mpu6050data->ax, mpu6050data->ay, mpu6050data->az, mpu6050data->fx, mpu6050data->fy);
-  sprintf(sendBuffer, "%s%01d%01d", sendBuffer, switchdata->backSwitch, switchdata->magnetSwitch);
-  Serial.printf("%s", sendBuffer);
-  Serial.println();
+  sprintf(sendBuffer, "%06d|%06d|%01d|", joystick->x, joystick->y, joystick->button);
+  sprintf(sendBuffer, "%s%06d|%06d|%06d", sendBuffer, mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
+  sprintf(sendBuffer, "%s%01d|%01d", sendBuffer, switchdata->backSwitch, switchdata->magnetSwitch);
+ // Serial.printf("%s", sendBuffer);
+ // Serial.println();
   Udp.write(sendBuffer);
   Udp.endPacket();
 }
