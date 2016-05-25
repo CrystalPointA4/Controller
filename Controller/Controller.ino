@@ -117,6 +117,8 @@ void mpu6050setup(){
     }
 }
 
+u_long lasttime;
+int count;
 void loop(void){
   //wait for interupt from mpu6050, in the mean time pol udp server for new data
   while (!mpuInterrupt && fifoCount < packetSize) {
@@ -149,19 +151,27 @@ void loop(void){
   //We are out of the while loop, so mpu interupt fired;
   readFifoMpu6050(&mpu6050data);  
 
-  readSwitches(&switchdata);
-
   readJoystick(&joystickdata);
-  
+
+  readSwitches(&switchdata);  
   //Send new data  
   joystickdata.button = 0;
 
   sendUdpMessage(&joystickdata, &mpu6050data, &switchdata); 
-}
+
+  if(millis() - lasttime > 1000){
+    printf("Samples per second: %d \n\r", count);
+    count = 0;
+    lasttime = millis();
+  }else{
+    count++;
+  }
+}  
 
 void readJoystick(struct JoystickData *joystickdata){
-  joystickdata->x = ads.readADC_SingleEnded(0) - joystickoffset_x;
-  joystickdata->y = ads.readADC_SingleEnded(1) - joystickoffset_y;
+  joystickdata->x = ads.readADC_SingleEnded(1) - joystickoffset_x;
+  delay(8);
+  joystickdata->y = ads.readADC_SingleEnded(0) - joystickoffset_y;
 }
 
 void readFifoMpu6050(struct MPU6050Data *mpu6050data){
@@ -196,6 +206,7 @@ void readFifoMpu6050(struct MPU6050Data *mpu6050data){
     mpu6050data->yaw = ypr[0] * 18000/M_PI;
     mpu6050data->pitch = ypr[1] * 18000/M_PI;
     mpu6050data->roll = ypr[2] * 18000/M_PI;  
+    printf("ypr: %d | %d | %d \n\r", mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
   }
 }
 
