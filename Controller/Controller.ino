@@ -1,5 +1,5 @@
 #include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050.h"
 
 #include <Wire.h>
 #include <WiFiUdp.h>
@@ -32,24 +32,21 @@ struct SwitchData{
 
 //mpu6050
 MPU6050 mpu;
-bool dmpReady = false;  // set true if DMP init was successful
-uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
-uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;     // count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
-
-// orientation/motion vars
-Quaternion q;           // [w, x, y, z]         quaternion container
-VectorFloat gravity;    // [x, y, z]            gravity vector
-float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
-
-volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
-void dmpDataReady() {
-    mpuInterrupt = true;
-}
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+double ax_scaled, ay_scaled, az_scaled;
+double gx_scaled, gy_scaled, gz_scaled;
+double roll, pitch, yaw;
+double gx_off, gy_off, gz_off;
+double gyro_scale = 131.0;
+double accel_scale = 16384.0;
 
 //Joystick offsets
 int joystickoffset_x, joystickoffset_y;
+
+//rumble
+boolean rumbleActivated;
+u_long rumbleDuration;
 
 //Data buffer for sensors
 struct MPU6050Data mpu6050data = {0};
@@ -58,8 +55,8 @@ struct SwitchData switchdata = {0};
 
 //UDP server (receiving) setup
 unsigned int udpPort = 2730;
-byte packetBuffer[512]; //udp package buffer
-char sendBuffer[45];
+byte packetBuffer[50]; //udp package buffer
+char sendBuffer[50];
 WiFiUDP Udp;
 
 void setup(void){
@@ -74,17 +71,21 @@ void setup(void){
   Wire.begin();
 
   //Magnetic sensor
-  pinMode(13,INPUT);
+  pinMode(12,INPUT);
+
+  //Rumble motor
+  pinMode(15, OUTPUT);
+
   
   //clearEeprom();
-  //connectLastBasestation();
-  searchBasestation();
+  connectLastBasestation();
+  //searchBasestation();
 
   delay(1000);
   ads.begin();
 
-  joystickoffset_x = ads.readADC_SingleEnded(0);
-  joystickoffset_y = ads.readADC_SingleEnded(1);
+  joystickoffset_x = ads.readADC_SingleEnded(0, 1);
+  joystickoffset_y = ads.readADC_SingleEnded(1, 1);
   
   mpu6050setup();
 }
@@ -92,126 +93,125 @@ void setup(void){
 void mpu6050setup(){
   mpu.initialize(); 
   Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
-  int devStatus = mpu.dmpInitialize();
+  calibrate();
+}
+
+void calibrate(){
+  getMotion6Scaled();
+  get_x_rotation(ax_scaled, ay_scaled, az_scaled, &roll);
+  get_y_rotation(ax_scaled, ay_scaled, az_scaled, &pitch);
+  yaw = 0;
   
-  mpu.setXGyroOffset(62);
-  mpu.setYGyroOffset(25);
-  mpu.setZGyroOffset(-11);
-  mpu.setXAccelOffset(-2030);
-  mpu.setYAccelOffset(11);
-  mpu.setZAccelOffset(2119); // 1688 factory default for my test chip
+  gx_off = gx_scaled;
+  gy_off = gy_scaled;
+  gz_off = gz_scaled;
 
-  if (devStatus == 0) {
-    mpu.setDMPEnabled(true);
+}
 
-    attachInterrupt(15, dmpDataReady, RISING); //intrupt pin on pin 15
-    mpuIntStatus = mpu.getIntStatus();
+void getMotion6Scaled(){
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  ax_scaled = ax / accel_scale;
+  ay_scaled = ay / accel_scale;
+  az_scaled = az / accel_scale;
+  gx_scaled = gx / gyro_scale;
+  gy_scaled = gy / gyro_scale;
+  gz_scaled = gz / gyro_scale;
+}
 
-    dmpReady = true;
+void get_y_rotation(double x, double y, double z, double* y_rotation){
+  *y_rotation = ((atan2(x, dist(y, z))) * 4068.0) / 71.0;
+}
 
-    packetSize = mpu.dmpGetFIFOPacketSize();
-    } else {
-        Serial.print(F("DMP Initialization failed (code "));
-        Serial.print(devStatus);
-        Serial.println(F(")"));
-    }
+void get_x_rotation(double x, double y, double z, double* x_rotation){
+  *x_rotation = ((atan2(y, dist(x, z))) * -4068.0) / 71.0;
+}
+
+double dist(double a, double b){
+  return sqrt((a * a) + (b * b));
 }
 
 u_long lasttime;
-int count;
 void loop(void){
-  //wait for interupt from mpu6050, in the mean time pol udp server for new data
-  while (!mpuInterrupt && fifoCount < packetSize) {
-    //receiving rumble or shock data from basestation
+  readMpu6050(&mpu6050data);
+  if(millis() - lasttime > 30){
+    lasttime = millis();
+    //Poll udp server
     int noBytes = Udp.parsePacket();
     if ( noBytes ) {
-        Serial.print(millis() / 1000);
-        Serial.print(":Packet of ");
-        Serial.print(noBytes);
-        Serial.print(" received from ");
-        Serial.print(Udp.remoteIP());
-        Serial.print(":");
-        Serial.println(Udp.remotePort());
-        // We've received a packet, read the data from it
-        Udp.read(packetBuffer,noBytes); // read the packet into the buffer
-        
-        // display the packet contents in HEX
-        for (int i=1;i<=noBytes;i++){
-          Serial.print(packetBuffer[i-1],HEX);
-          if (i % 32 == 0){
-            Serial.println();
-          }
-          else Serial.print(' ');
-        } 
+        Udp.read(packetBuffer,noBytes); 
+        if(packetBuffer[0] == '1'){
+          char tmpstr[7]; 
+          strncpy(tmpstr, (char*)packetBuffer+4, 6);
+          int rumbleDuration = atoi(tmpstr);
+  
+          strncpy(tmpstr, (char*)packetBuffer+11, 3);
+          int rumblePower = atoi(tmpstr);
+
+          rumble(rumbleDuration, rumblePower);
+  
+          Serial.printf("Received udp package! Rumble duration: %d ~ Rumble power : %d", rumbleDuration, rumblePower);
+        }else if(packetBuffer[0] == '2'){ //Shock
+          
+        }
+
         Serial.println();
     } 
-    delay(2);
-  }
+
+    if(rumbleActivated == true && millis() > rumbleDuration){
+      rumbleActivated = false;
+      analogWrite(15, 0);
+    }
   
-  //We are out of the while loop, so mpu interupt fired;
-  readFifoMpu6050(&mpu6050data);  
-
-  readJoystick(&joystickdata);
-
-  readSwitches(&switchdata);  
-  //Send new data  
-  joystickdata.button = 0;
-
-  sendUdpMessage(&joystickdata, &mpu6050data, &switchdata); 
-
-  if(millis() - lasttime > 1000){
-    printf("Samples per second: %d \n\r", count);
-    count = 0;
-    lasttime = millis();
+    readJoystick(&joystickdata);
+  
+    readSwitches(&switchdata);    
+    
+    //Send new data  
+    joystickdata.button = 0;
+    sendUdpMessage(&joystickdata, &mpu6050data, &switchdata); 
   }else{
-    count++;
+    delay(6);
   }
-}  
-
-void readJoystick(struct JoystickData *joystickdata){
-  joystickdata->x = ads.readADC_SingleEnded(1) - joystickoffset_x;
-  delay(8);
-  joystickdata->y = ads.readADC_SingleEnded(0) - joystickoffset_y;
 }
 
-void readFifoMpu6050(struct MPU6050Data *mpu6050data){
-  // reset interrupt flag and get INT_STATUS byte
-    mpuInterrupt = false;
-    mpuIntStatus = mpu.getIntStatus();
- 
-  // get current FIFO count
-  fifoCount = mpu.getFIFOCount();
-
-  // check for overflow (this should never happen unless our code is too inefficient)
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-        // reset so we can continue cleanly
-        mpu.resetFIFO();
-        Serial.println(F("FIFO overflow!"));
-  } else if (mpuIntStatus & 0x02){  
-    // wait for correct available data length, should be a VERY short wait
-    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-
-    // read a packet from FIFO
-    mpu.getFIFOBytes(fifoBuffer, packetSize);
-        
-    // track FIFO count here in case there is > 1 packet available
-    // (this lets us immediately read more without waiting for an interrupt)
-    fifoCount -= packetSize;
+void readMpu6050(struct MPU6050Data *mpu6050data){
+    getMotion6Scaled();
     
-    // get Euler angles in degrees
-    mpu.dmpGetQuaternion(&q, fifoBuffer);
-    mpu.dmpGetGravity(&gravity, &q);
-    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    gx_scaled -= gx_off;
+    gy_scaled -= gy_off;
+    gz_scaled -= gz_off;
 
-    mpu6050data->yaw = ypr[0] * 18000/M_PI;
-    mpu6050data->pitch = ypr[1] * 18000/M_PI;
-    mpu6050data->roll = ypr[2] * 18000/M_PI;  
-    printf("ypr: %d | %d | %d \n\r", mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
-  }
+
+    double gx_delta = (gx_scaled * 0.01);
+    double gy_delta = (gy_scaled * 0.01);
+    double gz_delta = (gz_scaled * 0.01);
+
+    double rotationx, rotationy;
+    get_y_rotation(ax_scaled, ay_scaled, az_scaled, &rotationy);
+    get_x_rotation(ax_scaled, ay_scaled, az_scaled, &rotationx);
+
+    pitch = 0.98 * (pitch + gy_delta) + (0.02 * rotationy);
+    roll = 0.98 * (roll + gx_delta) + (0.02 * rotationx);    
+
+    mpu6050data->pitch = pitch*100;
+    mpu6050data->roll = roll*100;
+    mpu6050data->yaw = 0;
+}
+
+void readJoystick(struct JoystickData *joystickdata){
+  joystickdata->x = ads.readADC_SingleEnded(1, 0) - joystickoffset_x;
+  delay(8);
+  joystickdata->y = ads.readADC_SingleEnded(0, 0) - joystickoffset_y;
 }
 
 void readSwitches(struct SwitchData *switchdata){
-  switchdata->magnetSwitch = !digitalRead(13);  
+  switchdata->magnetSwitch = !digitalRead(12);  
+}
+
+void rumble(int duration, int power){
+  rumbleActivated = true;
+  analogWrite(15, power);
+  rumbleDuration = millis() + duration;
 }
 
 void searchBasestation(void){
@@ -294,10 +294,10 @@ void calculateWiFiPassword(String WifiSSID, char *WifiPassword)
 void sendUdpMessage(struct JoystickData *joystick, struct MPU6050Data *mpu6050data, struct SwitchData *switchdata){
   Udp.beginPacket(BasestationIp, BasestationPort);
   sprintf(sendBuffer, "%06d|%06d|%01d|", joystick->x, joystick->y, joystick->button);
-  sprintf(sendBuffer, "%s%06d|%06d|%06d", sendBuffer, mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
+  sprintf(sendBuffer, "%s%06d|%06d|%06d|", sendBuffer, mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
   sprintf(sendBuffer, "%s%01d|%01d", sendBuffer, switchdata->backSwitch, switchdata->magnetSwitch);
- // Serial.printf("%s", sendBuffer);
- // Serial.println();
+  Serial.printf("%s", sendBuffer);
+  Serial.println();
   Udp.write(sendBuffer);
   Udp.endPacket();
 }
