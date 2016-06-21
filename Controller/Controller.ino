@@ -196,6 +196,10 @@ void readMpu6050(struct MPU6050Data *mpu6050data){
     mpu6050data->pitch = pitch*100;
     mpu6050data->roll = roll*100;
     mpu6050data->yaw = 0;
+    mpu6050data->ax = ax_scaled;
+    mpu6050data->ay = ay_scaled;
+    mpu6050data->az = az_scaled;
+
 }
 
 void readJoystick(struct JoystickData *joystickdata){
@@ -296,6 +300,7 @@ void sendUdpMessage(struct JoystickData *joystick, struct MPU6050Data *mpu6050da
   sprintf(sendBuffer, "%06d|%06d|%01d|", joystick->x, joystick->y, joystick->button);
   sprintf(sendBuffer, "%s%06d|%06d|%06d|", sendBuffer, mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
   sprintf(sendBuffer, "%s%01d|%01d", sendBuffer, switchdata->backSwitch, switchdata->magnetSwitch);
+   sprintf(sendBuffer, "%s%06d|%06d|%06d", sendBuffer, mpu6050data->ax, mpu6050data->ay, mpu6050data->az);
   Serial.printf("%s", sendBuffer);
   Serial.println();
   Udp.write(sendBuffer);
