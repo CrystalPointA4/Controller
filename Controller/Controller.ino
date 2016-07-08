@@ -55,24 +55,34 @@ struct SwitchData switchdata = {0};
 
 //UDP server (receiving) setup
 unsigned int udpPort = 2730;
-byte packetBuffer[50]; //udp package buffer
-char sendBuffer[50];
+byte packetBuffer[68]; //udp package buffer
+char sendBuffer[68];
 WiFiUDP Udp;
+
+//Button pressed counter
+boolean isCounting = false;
+u_long startCountingTime;
 
 void setup(void){
   Serial.begin(115200);
   Serial.println("Starting controller..");
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();  
+  
   EEPROM.begin(512);
 
   delay(10);
-  Udp.begin(udpPort);
-  Wire.begin();
+  Wire.begin(13,14);
 
   //Magnetic sensor
+  pinMode(5,INPUT);
+
+  //Joystick button
   pinMode(12,INPUT);
 
+  //back button
+  pinMode(0,INPUT);
+  
+  
   //Rumble motor
   pinMode(15, OUTPUT);
 
@@ -81,11 +91,14 @@ void setup(void){
   connectLastBasestation();
   //searchBasestation();
 
-  delay(1000);
+  delay(200);
+  Udp.begin(udpPort);
   ads.begin();
 
   joystickoffset_x = ads.readADC_SingleEnded(0, 1);
   joystickoffset_y = ads.readADC_SingleEnded(1, 1);
+
+  delay(200);
   
   mpu6050setup();
 }
@@ -133,7 +146,7 @@ double dist(double a, double b){
 u_long lasttime;
 void loop(void){
   readMpu6050(&mpu6050data);
-  if(millis() - lasttime > 30){
+  if(millis() - lasttime > 28){
     lasttime = millis();
     //Poll udp server
     int noBytes = Udp.parsePacket();
@@ -167,10 +180,9 @@ void loop(void){
     readSwitches(&switchdata);    
     
     //Send new data  
-    joystickdata.button = 0;
     sendUdpMessage(&joystickdata, &mpu6050data, &switchdata); 
   }else{
-    delay(6);
+    delay(5);
   }
 }
 
@@ -206,10 +218,23 @@ void readJoystick(struct JoystickData *joystickdata){
   joystickdata->x = ads.readADC_SingleEnded(1, 0) - joystickoffset_x;
   delay(8);
   joystickdata->y = ads.readADC_SingleEnded(0, 0) - joystickoffset_y;
+  joystickdata->button = !digitalRead(12);
 }
 
 void readSwitches(struct SwitchData *switchdata){
-  switchdata->magnetSwitch = !digitalRead(12);  
+  switchdata->backSwitch = !digitalRead(0);  
+  switchdata->magnetSwitch = !digitalRead(5);  
+  if(!switchdata->backSwitch){
+     isCounting = false;
+  }else if(isCounting){
+      if(millis() - startCountingTime > 8000){ //Pressed longer then 8 seconds, start searching for basestation
+        rumble(1000, 150);
+        searchBasestation();
+      }
+  }else if(switchdata->backSwitch){
+    isCounting = true;
+    startCountingTime = millis();
+  }
 }
 
 void rumble(int duration, int power){
@@ -275,10 +300,14 @@ void connectLastBasestation(void){
       Serial.printf("Valid basestation information in eeprom found! \nEeprom SSID: %s \nEeprom Password: %s", eepromWifiSSID, eepromWifiPassword);
       
       //Connect to the basestation
+      startCountingTime = millis();
       WiFi.begin(eepromWifiSSID, eepromWifiPassword);
       while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        if(millis() - startCountingTime > 15000){
+          break;
+        }
       }
     } 
 }
@@ -299,7 +328,7 @@ void sendUdpMessage(struct JoystickData *joystick, struct MPU6050Data *mpu6050da
   Udp.beginPacket(BasestationIp, BasestationPort);
   sprintf(sendBuffer, "%06d|%06d|%01d|", joystick->x, joystick->y, joystick->button);
   sprintf(sendBuffer, "%s%06d|%06d|%06d|", sendBuffer, mpu6050data->yaw, mpu6050data->pitch, mpu6050data->roll);
-  sprintf(sendBuffer, "%s%01d|%01d", sendBuffer, switchdata->backSwitch, switchdata->magnetSwitch);
+  sprintf(sendBuffer, "%s%01d|%01d|", sendBuffer, switchdata->backSwitch, switchdata->magnetSwitch);
    sprintf(sendBuffer, "%s%06d|%06d|%06d", sendBuffer, mpu6050data->ax, mpu6050data->ay, mpu6050data->az);
   Serial.printf("%s", sendBuffer);
   Serial.println();
